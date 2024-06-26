@@ -1,0 +1,130 @@
+name: QA E2E tests allure
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+
+
+
+env:
+  PYTHON_VERSION: 3.6
+  AWS_REGION: eu-central-1
+  ENVIRONMENT: test
+  CHROME_VERSION: 97.0.4692.36
+  ALLURE_VERSION: 2.17.0
+  CF_DISTRIBUTION_ID: E1ROE8HI6HSWQL
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Install OpenVPN
+        run: |
+          sudo apt-get update
+          sudo apt-get --assume-yes --no-install-recommends install openvpn
+
+      - name: Install oathtool
+        run: |
+          sudo apt-get install -y oathtool
+
+      - name: Setup VPN config
+        run: |
+          echo "${{ secrets.OVPN_USR_CONF }}" > ${{ secrets.OVPN_USER }}.ovpn
+          openvpn_pass=`oathtool --totp -b ${{ secrets.OVPN_USR_SCR_KEY }}` && printf "${{ secrets.OVPN_USER }}\n${openvpn_pass}\n" > secrets.txt
+
+      - name: Connect VPN
+        run: |
+          sudo openvpn --config "${{ secrets.OVPN_USER }}.ovpn" --daemon
+
+      - name: Wait for a VPN connection
+        run: until dig @${{ secrets.OVPN_DNS_IP }} ${{ secrets.API_URL }} A +time=1; do sleep 2; done
+
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID_TEST }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_TEST }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Install dependencies 
+        run: |
+         cp .env.expample .env
+         printf "\nTEST_ORG = ${{ secrets.TEST_ORG }}\nDEFAULT_USER_SA = ${{ secrets.DEFAULT_USER_SA }}\nDEFAULT_PASSWORD = ${{ secrets.DEFAULT_PASSWORD }}\n" >> .env
+         pip install -r requirements.txt
+
+      - name: Install allure
+        run: |
+         wget https://github.com/allure-framework/allure2/releases/download/${{ env.ALLURE_VERSION }}/allure-${{ env.ALLURE_VERSION }}.tgz
+         tar -zxvf allure-${{ env.ALLURE_VERSION }}.tgz -C /opt/
+         sudo ln -s /opt/allure-${{ env.ALLURE_VERSION }}/bin/allure /usr/bin/allure 
+         allure --version
+
+      - name: Copy history folder
+        run: |
+         aws s3 ls s3://cmm-test-frontend/allure-report/history/ || true
+         aws s3 cp --recursive s3://cmm-test-frontend/allure-report/history/ ./allure-results/history/
+         ls -la ./allure-results/history/
+
+      - name: Run selenium-hub docker container
+        run: |
+         docker-compose up -d
+
+      - name: Run parallel tests
+        run: |
+         pytest -n=4 --dist=loadscope --alluredir=allure-results tests/parallel
+
+      - name: Run not parallel tests
+        if: always()
+        run: |
+         pytest --alluredir=allure-results tests/not_parallel
+
+      - name: Generate enviroment properties for allure
+        if: always()
+        run: |
+         echo "browser=chrome  
+               version=${{ env.CHROME_VERSION }}
+               env=${{ env.ENVIRONMENT }}" > allure-results/environment.properties
+
+      - name: Generate executor config
+        if: always()
+        run: |
+         echo '{ "name": "GitHub Actions"}' > allure-results/executor.json
+
+      - name: Generate report
+        if: always()
+        run: |
+         ls -la ./allure-results/history/
+         allure generate --clean
+
+      - name: Copy allure-results to bucket  
+        if: always()
+        run: |
+         [ "$(ls -A ./allure-report)" ] && aws s3 sync --delete ./allure-report/ s3://cmm-test-frontend/allure-report/
+
+      - name: Clear cache on CloudFront
+        if: always()
+        run: |
+          CF_INVALIDATION_ID=`aws cloudfront create-invalidation --distribution-id $CF_DISTRIBUTION_ID --paths "/allure-report/*" --query Invalidation.Id --output text`
+          aws cloudfront wait invalidation-completed --distribution-id $CF_DISTRIBUTION_ID --id $CF_INVALIDATION_ID
+
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_TITLE:  "Test: ${{ job.status }}"
+          SLACK_MESSAGE: "https://test.excav8.io/allure-report/index.html"
+      
+      - name: Kill VPN connection
+        if: always()
+        run: sudo killall openvpn
