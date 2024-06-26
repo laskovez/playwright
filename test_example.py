@@ -1,8 +1,11 @@
 import re
+from time import sleep
+
 from playwright.sync_api import Page, expect
 
 def navigate_to_playwright(page: Page):
     page.goto("https://playwright.dev/")
+    sleep(1)
 
 def test_has_title(page: Page):
     navigate_to_playwright(page)
